@@ -1,4 +1,5 @@
 from json.decoder import JSONDecodeError
+from os import stat_result
 import redis
 import logging
 import random
@@ -7,10 +8,9 @@ import json
 import sys
 from typing import Final
 
-from redis.client import PubSub, Redis                # ~const non proprio const, serve Python 3.8
-
+from redis.client import PubSub, Redis
 """
-Questo è il master sincrono statico base, il suo compito è:
+Questo è il master sincrono autorizzato base, il suo compito è:
     1) generare un task e notificarlo agli iscritti
     2) leggere le proposte degli iscritti disponibili
     3) scegliere l'iscritto che svolga il task
@@ -18,163 +18,241 @@ Questo è il master sincrono statico base, il suo compito è:
     5) Ripetere
 """
 
-HOST : Final = "localhost"
+#HOST : Final = "localhost"
+HOST : Final = "192.168.1.17"
 PORT : Final = 6379
-MASTER_NAME : Final = f"master{random.randint(0, 1e4)}_"
+DB : Final = 0
+MAX_EXECUTION_TIME : Final = 3000      #massimo tempo di esecuzione dei task (ms)
+MAX_NETWORK_DELAY : Final = 150     #massimo ritardo di rete (ms)
+REPUBLISH_DELAY : Final = 1/0.5         #quanti task pubblicare al secondo
 
 format = "%(asctime)s: %(message)s"
 logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
 
-pool = redis.ConnectionPool(host=HOST, port=PORT)
-taskTypes = ["task+", "task-", "task*", "task/"]
-only_sum = False
-#taskTypes = ["task+"]
-task_counter = 0
-agent_set = set()
-
-class Task:
-    def __init__(self):
-        self.task_type = taskTypes[random.randint(0,len(taskTypes)-1)]
+class Task(object):     #viene serializzata in JSON e inviata
+    def __init__(self, task_types, task_counter, master_name):
+        super().__init__()
+        self.task_type = task_types[random.randint(0,len(task_types)-1)]
         self.task_name = f"{self.task_type}_{task_counter}"
         self.a = random.randint(1, 100)
         self.b = random.randint(1, 100)
         self.result = None
-        self.master_receiving_channel = MASTER_NAME+self.task_name    # lo imposto come identificativo del task
+        self.master_receiving_channel = master_name+self.task_name    # lo imposto come identificativo del task
+        self.chosen_worker = ''
+
+    def set(self, type, taskname, a, b, master_name ):
+        self.task_type = type
+        self.task_name = taskname
+        self.a = a
+        self.b = b
+        self.master_receiving_channel = master_name + self.task_name
 
     def __repr__(self) -> str:
         return self.master_receiving_channel
 
-def write_stat_agents():
-    r = redis.Redis(connection_pool=pool)
-    f = open(f"masters_stats_auth/stats.txt", "w+")     #se voglio le stat die task per ogni master, devo creare i dati nel master 
+class Master(object):
+    def __init__(self, only_sum=False) -> None:
+        super().__init__()
+        self.master_name = f"master{random.randint(0, 1e4)}_"
+        self.pool = redis.ConnectionPool(host=HOST, port=PORT, db=0)
+        self.subscriber = redis.Redis(connection_pool=self.pool).pubsub()
+        self.received_messages = []
+        self.agent_set = set()
+        self.task_counter = 0
+        self.task_types = ["task+", "task-", "task*", "task/"]
+        self.only_sum = only_sum
+        self.reassign_task_counter = 0
+        if (self.only_sum):
+            self.task_types = ["task+"]
+    
+    def create_task(self) -> None:
+        #pulizia dati task precedente
+        if hasattr(self, 'active_task'):
+            self.subscriber.unsubscribe(self.active_task.master_receiving_channel)
+            logging.info(f"Dis-Iscritto da {self.active_task.master_receiving_channel}")
+        self.received_messages = []
+
+        #creazione nuovo task
+        self.active_task = Task(self.task_types, self.task_counter, self.master_name)
+        self.subscriber.subscribe(self.active_task.master_receiving_channel)
+        logging.info(f"Iscritto a {self.active_task.master_receiving_channel}")
+        self.task_counter+=1
+
+
+    def publish_task(self) -> None:
+        task_message_json = json.dumps(self.active_task.__dict__)
+        r = redis.Redis(connection_pool=self.pool)
+        n = r.publish(self.active_task.task_name, task_message_json)    #invio la key dove inserire il risultato e i numeri
+        logging.info(f'\nTask published "{task_message_json}", on channel "{self.active_task.task_name}" received by {n} agents')
+
+        while n == 0:
+            time.sleep(REPUBLISH_DELAY)
+            n = r.publish(self.active_task.task_name, task_message_json)    #invio la key dove inserire il risultato e i numeri
+            logging.info(f'Task published "{task_message_json}" received by {n} agents')
+
+    def receive_proposes_and_assign(self) -> str:
+        #ricevo le proposte degli slave (canale)---------------------------------------------------------------------------------
+        proposals = []
+
+        while True:
+            time.sleep(MAX_NETWORK_DELAY/1000)                                                       # attende messaggi dagli agenti (prova a ridurre)
+            msg = self.subscriber.get_message(ignore_subscribe_messages=True, timeout=0.0)
+
+            if msg is not None:
+                self.received_messages.append(msg)
+
+            while msg is not None:
+                try:
+                    if msg["channel"].decode('utf-8') == self.active_task.master_receiving_channel and msg['data'].decode("utf-8")[0]=="{":   #da controllare la condizione
+                        data_dict = json.loads(msg['data'])
+                        if data_dict['propose']==True and msg not in proposals:
+                            proposals.append(msg)
+                        else:
+                            logging.info(f"Ricevuta una non proposta (no propose==True)")
+
+                    msg = self.subscriber.get_message(ignore_subscribe_messages=True, timeout=0.0)
+                    if msg is not None:
+                        self.received_messages.append(msg)
+                except Exception as e:
+                    logging.exception(f"Errore nella ricezione delle proposte")
+                    break
+            
+            logging.info(f"Proposal received: {len(proposals)}, : {proposals}")
+            logging.info(f"Messages received: {len(self.received_messages)}, : {self.received_messages}")
+
+            if len(proposals)==0:        #se non ricevo proposte
+                logging.info(f"No proposals for {self.active_task.task_name}")
+                self.publish_task()
+
+            # scelgo l'agente che svolge il task -------------------------------------------------------------------------------
+            else:                       #se ho ricevuto proposte
+                chosen_worker = self.choose_worker(proposals=proposals)
+                return chosen_worker
+
+    def choose_worker(self, proposals:list) -> str:
+        '''Sceglie il worker dalla lista delle proposte e
+        Inserisce il suo nome dentro il dataspace in modo che egli sappia di essere stato scelto'''
+        
+        choice = random.randint(0, len(proposals)-1)
+        msg = proposals[choice]
+
+        try:
+            r = redis.Redis(connection_pool=self.pool)
+
+            dict_message = json.loads(msg['data'])
+            chosen_agent = dict_message['agent']
+            bool_propose = dict_message['propose']
+            if bool_propose:
+                r.set(self.active_task.master_receiving_channel, chosen_agent, px=MAX_NETWORK_DELAY+MAX_EXECUTION_TIME+MAX_NETWORK_DELAY)       # metto il nome del primo agente della lista dentro una key con il nome del task
+                logging.info(f"Chosen agent '{chosen_agent}' inserted in Redis at {self.active_task.master_receiving_channel}")
+                self.chosen_worker = chosen_agent
+                return chosen_agent
+            else:
+                logging.error("Errore: La proposta scelta non era una proposta")
+                    
+        except Exception as e:
+            logging.exception(e)
+
+    def update_answerer_stats(self, successful_chosen_worker):
+        '''Aggiorna su redis le statistiche delle task completate dal worker che ha eseguito il task'''
+        r = redis.Redis(connection_pool=self.pool)
+
+        self.agent_set.add(successful_chosen_worker)
+        if not r.get(successful_chosen_worker):
+            r.set(successful_chosen_worker, 1)
+        else:
+            r.incr(successful_chosen_worker)
+
+    def receive_result(self):
+        '''Riceve il messaggio di risultato dell'agente scelto per il task, dopo di questo deve ripartire un nuovo task'''
+        
+        #ricevo il messaggio di risposta dal worker
+        while True:
+            msg = self.subscriber.get_message(ignore_subscribe_messages=True, timeout=(MAX_EXECUTION_TIME+MAX_NETWORK_DELAY)/1000)  #il timeout dovrebbe indicare il tempo massimo di esecuzione del task + margine
+
+            while msg is not None:
+                self.received_messages.append(msg)
+                msg = self.subscriber.get_message(ignore_subscribe_messages=True, timeout=0.0)
+            
+            state = self.search_result()
+
+            if state==0:
+                ''' Task completato correttamente '''
+                break
+            elif state==-1:
+                ''' Risultato non trovato nei messaggi '''
+
+                if self.reassign_task_counter >6:
+                    self.reassign_task_counter = 0
+                    self.publish_task()
+                    self.receive_proposes_and_assign()
+            
+        #Aggiorno le stat di fine task
+        self.update_answerer_stats(self.chosen_worker)
+
+    def search_result(self) -> int:
+        '''Cerca il messaggio risultato tra quelli ricevuti'''
+        logging.info(f"""Ricerca del messaggio di risposta in: {self.received_messages}""")
+        for m in self.received_messages:
+            try:
+                msg_dict = json.loads(m['data'])
+                if 'fail' not in msg_dict or 'result' not in msg_dict:
+                    continue
+
+                agent_answerer = msg_dict['agent']
+                agent_result = msg_dict['result']
+                agent_fail = msg_dict['fail']
+                logging.info(f'Campi estratti da dal messaggio di risposta: agente rispondente: "{agent_answerer}", risultato: "{agent_result}", fail: "{agent_fail}"')
+
+                if m['channel'].decode('utf-8')==self.active_task.master_receiving_channel and agent_answerer==self.chosen_worker and agent_fail==False:
+                    self.active_task.result = agent_result
+                    logging.info(f"Success, chosen agent {agent_answerer} has completed task {self.active_task.task_name} [{self.active_task.a, self.active_task.b}] with result {self.active_task.result}")
+                    if self.only_sum and self.active_task.result != (self.active_task.a+self.active_task.b) and len(self.task_types)==1:
+                        logging.error(f"!!!!!!!Risultato sbagliato!!!!!-----------------------------------------------------------------------------------------------")
+                    return 0
+
+            except Exception as e:
+                logging.error(f"messaggio non formattato JSON\n{e}")
+                    
+        logging.error(f"Nei messaggi ricevuti non vi è il risultato cercato")
+        self.received_messages = []
+        self.reassign_task_counter += 1
+        return -1
+
+# scrive su txt le statistiche del master
+def write_stat_agents(master:Master):
+    r = redis.Redis(connection_pool = master.pool)
+    f = open(f"stats.txt", "w+")     #se voglio le stat del task per ogni master, devo creare i dati nel master 
     string = ""
-    for e in agent_set:
+    for e in master.agent_set:
         string += f'{e} has accomplished {r.get(e).decode("utf-8")} tasks\n'
     f.write(string)
     f.close()
 
-def publish_task(redis, task:Task ) -> None:
-    task_message_json = json.dumps(task.__dict__)
-    n = r.publish(task.task_name, task_message_json)    #invio la key dove inserire il risultato e i numeri
-    logging.info(f'\nTask published "{task_message_json}" received by {n} agents')
-
-    while n == 0:
-        time.sleep(0.1)
-        n = r.publish(task.task_name, task_message_json)    #invio la key dove inserire il risultato e i numeri
-        logging.info(f'Task published "{task_message_json}" received by {n} agents')
-
-def receive_proposes(r:Redis, p:PubSub, active_task: Task):
-    #ricevo le proposte degli slave (canale)---------------------------------------------------------------------------------
-        messages = []
-        counter = 0
-        while True:
-            time.sleep(0.05)                                                       # attende messaggi dagli agenti (prova a rimuovere)
-            msg = p.get_message(ignore_subscribe_messages=True, timeout=0.0)
-            
-            while msg is not None:
-                try:
-                    if msg["channel"].decode('utf-8') == active_task.master_receiving_channel and msg['data'].decode("utf-8")[0]=="{" and json.loads(msg['data'])['propose']:
-                        messages.append(msg)
-                    msg = p.get_message(ignore_subscribe_messages=True, timeout=0.0)
-                except Exception as e:
-                    break
-            
-            logging.info(f"Proposal received: {len(messages)}")
-
-            # scelgo l'agente che svolge il task (casuale)-------------------------------------------------------------------------------
-
-            if len(messages)==0:        #se non ricevo messaggi
-                logging.info(f"No proposals for {active_task.task_name}")
-                counter += 1
-                if counter>6:
-                    logging.info(f"Proposal time staled: re-publishing task")
-                    publish_task(r, active_task)
-                    counter = 0
-                
-            else:                       #se ricevo messaggi
-                choice = random.randint(0, len(messages)-1)
-                msg = messages[choice]               # forma messaggi: {'agent':'Agent001', 'propose':true}
-                print(f"Agente scelto per il task: ", msg)
-                try:
-                    dict_message = json.loads(msg['data'])
-                    chosen_agent = dict_message['agent']
-                    bool_propose = dict_message['propose']
-                    if bool_propose:
-                        r.set(active_task.master_receiving_channel, chosen_agent, ex=15)                                                # metto il nome del primo agente della lista dentro una key con il nome del task
-                        logging.info(f"Chosen agent '{chosen_agent}' inserted in Redis at {active_task}")
-                        return chosen_agent
-                        break
-                    
-                except Exception as e:
-                    logging.exception(e)
-
-if __name__ == "__main__":
+def test_connection_redis() -> None:
     try:
-        r = redis.Redis(connection_pool=pool) 
-        p = r.pubsub()
-        p.subscribe("to-master")
-    except Exception:
+        r = redis.Redis(host=HOST, port=PORT, db=0)
+        r.set(name='foo', value='bar', ex=1, nx=True)
+        logging.info(f"Connected to Redis on '{HOST}','{PORT}'")
+    except Exception as e:
         sys.exit(f"Error: No connection to Redis server on socket: ({HOST}; {PORT})\nActivate one or choose an available socket")
 
+
+if __name__ == "__main__":
+    test_connection_redis()
+
+    master = Master(only_sum=True)
     logging.info("Start pushing tasks")
-    while True:        
-        active_task = Task()
+    while True:
 
+        master.create_task()
         #pubblico task-----------------------------------------------------------------------------------------------------------
-        p.subscribe(active_task.master_receiving_channel)
-        logging.info(f"Subscription to {active_task.master_receiving_channel}")
-        publish_task(r, active_task)        
-
+        master.publish_task()
         #ricevo le proposte degli slave (canale)---------------------------------------------------------------------------------
-        chosen_agent = receive_proposes(r=r, p=p, active_task=active_task)
+        chosen_worker = master.receive_proposes_and_assign()
         
-        #ricevo il risultato (eventualmente ricevo un fail e riassegno il calcolo)-----------------------------------------------------------------------
-        counter = 0
-        while True:
-            msg = p.get_message(ignore_subscribe_messages=True, timeout=1.0)        #allo scadere del timeout posso provare a riproporre il task
-            if counter>5:
-                counter = 0
-                print("counter maggiore di 5, possibile stale risposta")
-                #publish_task(r, active_task)        #va rimodulato il programma con l'aggiunta della riassegnazione del task
-                chosen_agent = receive_proposes(r=r, p=p, active_task=active_task)
-                print("terzo stato-----------------------------------------------")
-                continue
-            
-            if msg is None:
-                counter += 1
-                continue
+        master.receive_result()
 
-            try:
-                message_corp = json.loads(msg['data'])
-                agent_answerer = message_corp['agent']
-                active_task.result = message_corp['result']
-                task_name_answer = message_corp['task_name']
-
-                if chosen_agent==agent_answerer and task_name_answer==active_task.task_name:
-                    logging.info(f"Success, chosen agent {chosen_agent} has completed task {active_task.task_name} [{active_task.a,active_task.b}] with result {active_task.result}")
-                    if only_sum and active_task.result != (active_task.a+active_task.b) and len(taskTypes)==1:
-                        logging.error(f"!!!!!!!Risultato sbagliato!!!!!-----------------------------------------------------------------------------------------------")
-                    break
-
-            except Exception as e:
-                counter +=1
-
-                logging.error(e)
-                logging.error(msg)
-                continue
-
-            #controllo che il messaggio ricevuto sia quello che cerco
-            
-        p.unsubscribe(active_task.master_receiving_channel)
-        logging.info(f"Unsubscription to {active_task.master_receiving_channel}")
-
-        agent_set.add(agent_answerer)
-        if not r.get(agent_answerer):
-            r.set(agent_answerer, 1)
-        else:
-            r.incr(agent_answerer)
-
-        write_stat_agents()
-
-        task_counter += 1
-        #time.sleep(0)
+        write_stat_agents(master)
+        
+        time.sleep(REPUBLISH_DELAY)

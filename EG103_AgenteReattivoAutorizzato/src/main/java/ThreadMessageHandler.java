@@ -1,7 +1,5 @@
 import redis.clients.jedis.*;
 import org.json.*;
-//import java.util.Random;
-
 
 // DA MODIFICARE
 /* Definisco il thread che deve gestire una sessione per l'agente:
@@ -16,6 +14,9 @@ public class ThreadMessageHandler extends Thread{
 	//definisci i campi	
 	JedisPool pool;
 	String IdAgent;
+	long MAX_EXECUTION_TIME;
+	long MAX_NETWORK_DELAY;
+	
 	String pattern;
 	String taskName;	
 	String taskType;
@@ -73,7 +74,6 @@ public class ThreadMessageHandler extends Thread{
 		System.out.printf("Task Autorizzato %s, agente %s\n", taskName, IdAgent);
 		
 		getResult();
-		
 		//mando al master il risultato come testo messaggio in JSON
 		this.responseJSON = "{\"result\":"+String.valueOf(this.result)+","
 				+ "\"agent\":\""+IdAgent+"\","
@@ -83,8 +83,10 @@ public class ThreadMessageHandler extends Thread{
 				+ "}";
 	}
 	
-	public ThreadMessageHandler(String IdAgent, JedisPool pool, String pattern, String channel, String message) {
+	public ThreadMessageHandler(String IdAgent, JedisPool pool, String pattern, String channel, String message, long MAX_EXECUTION_TIME, long MAX_NETWORK_DELAY) {
 		super();
+		this.MAX_EXECUTION_TIME = MAX_EXECUTION_TIME;
+		this.MAX_NETWORK_DELAY = MAX_NETWORK_DELAY;
 		this.terminate=false;
 		this.acceptTask=true;			//si può fare casuale
 		this.IdAgent = IdAgent;				// Id agente di calcolo
@@ -111,7 +113,7 @@ public class ThreadMessageHandler extends Thread{
 		try {
 			System.out.println("\nDato pattern '"+this.pattern+"', da canale '"+this.channel+"', messaggio: '"+this.masterTaskName+"'.");
 			System.out.println("Inizio del Thread "+Thread.currentThread().getName());
-			if (terminate) {System.out.println("Chiuso il Thread: "+Thread.currentThread().getName());return;}
+			if (terminate) {System.out.println("Chiuso il Thread: "+Thread.currentThread().getName()); return;}
 			
 			//propongo il thread per il compito al master
 			boolean prop= this.propose();
@@ -121,12 +123,13 @@ public class ThreadMessageHandler extends Thread{
 				// Ricezione conferma o return del Thread-------------------------------------------------------------
 				// conferma come lettura d una key 'nome_task' e il nome dell'agente corrisponde di ha l'auth oppure si disfa il thread
 				Jedis j = pool.getResource();
+				Thread.sleep(this.MAX_NETWORK_DELAY);
 				String authorizedAgent = j.get(this.masterTaskName);
 				int counter = 0;
 				while (true) {
 					if (authorizedAgent == null || authorizedAgent.isBlank()) {	//key non ancora creata
 						System.out.println("Leggo "+authorizedAgent+" su: "+this.masterTaskName);
-						Thread.sleep(50);
+						Thread.sleep(this.MAX_NETWORK_DELAY);
 						authorizedAgent = j.get(this.masterTaskName);
 						counter++;
 						if (counter > 12) {System.out.println("Master took too long to insert "+this.masterTaskName+" executioner"); break;}
@@ -134,7 +137,9 @@ public class ThreadMessageHandler extends Thread{
 					
 						// Esecuzione task-------------------------------------------------------------------------------
 						System.out.println("Scelto con "+IdAgent+"=="+authorizedAgent+" su: "+taskName);
-						//Thread.sleep(1000);
+						
+						//attesa variabile
+						Thread.sleep((long)(this.MAX_EXECUTION_TIME * Math.random()));
 						execute();
 					
 						long n = j.publish(this.masterTaskName, this.responseJSON);
