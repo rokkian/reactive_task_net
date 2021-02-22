@@ -1,5 +1,9 @@
 # Reactive Task Net
 
-EG103 è il worker svolto in Maven
+This architecture is viable to implement comunication based contract net, where a Master who owns a task decides on parameters who is the best worker to execute the task between the ones that proposed.
 
-taskMaster_reactive_authorized.py è il master
+Here the task Master is implemented in Python3 and the workers are implemented in Java Maven.
+
+There can be multiple task master and workers active at the same moment and if MAX_NETWORK_DELAY and MAX_EXECUTION_TIME are known the system is process crash tolerant.
+
+This demo can be the base of systems like auctions or other real-time assegantion problems.
